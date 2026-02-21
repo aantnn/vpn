@@ -5,7 +5,7 @@ use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
-use std::task::{ready, Context, Poll};
+use std::task::{ready, Context as stdContext, Poll};
 use anyhow::{Result, anyhow, Context};
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
@@ -428,7 +428,7 @@ pub async fn tun_read_loop(fd: jint) -> Result<()> {
     let mut stream = AsyncTcpStream::new(stream).unwrap();
         stream.read(&mut buf).await.with_context(|| "Failed to connect to 192.168.1.169:8080 in tun_read_loop".to_string())?; // 3. Send a simple HTTP-ish header once
     let http_header = b"POST /tunnel HTTP/1.1\r\nHost: example\r\n\r\n";
-    stream.set_nodelay(true)?;
+    //stream.set_nodelay(true)?;
     stream.write_all(http_header).await?;
 
 
@@ -553,7 +553,7 @@ impl AsyncTcpStream {
 impl tokio::io::AsyncRead for AsyncTcpStream {
     fn poll_read(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &mut stdContext<'_>,
         buf: &mut ReadBuf<'_>
     ) -> Poll<std::io::Result<()>> {
         loop {
@@ -575,7 +575,7 @@ impl tokio::io::AsyncRead for AsyncTcpStream {
 impl tokio::io::AsyncWrite for AsyncTcpStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &mut stdContext<'_>,
         buf: &[u8]
     ) -> Poll<std::io::Result<usize>> {
         loop {
@@ -590,7 +590,7 @@ impl tokio::io::AsyncWrite for AsyncTcpStream {
 
     fn poll_flush(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &mut stdContext<'_>,
     ) -> Poll<std::io::Result<()>> {
         // tcp flush is a no-op
         Poll::Ready(Ok(()))
@@ -598,7 +598,7 @@ impl tokio::io::AsyncWrite for AsyncTcpStream {
 
     fn poll_shutdown(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &mut stdContext<'_>,
     ) -> Poll<std::io::Result<()>> {
         self.inner.get_ref().shutdown(std::net::Shutdown::Write)?;
         Poll::Ready(Ok(()))
