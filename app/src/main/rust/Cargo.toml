@@ -1,0 +1,37 @@
+[package]
+name = "vpn"
+version = "0.1.0"
+edition = "2024"
+
+[lib] 
+crate-type = ["cdylib"]
+
+[dependencies]
+tokio = { version = "1.49", features = ["full"] }
+tokio-stream ="0.1.18"
+# Modern hyper
+hyper = { version = "1.8", features = ["full"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
+http-body-util ="0.1"
+
+# Modern TLS stack
+rustls = "0.23"
+tokio-rustls = "0.26"
+hyper-rustls = "0.27"
+rustls-pemfile = "2.1"
+
+# TUN (modern)
+tun = { version = "0.8", features = ["async"] }
+
+bytes = "1.11"
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+
+libc ="0.2"
+jni = { version = "0.22", features = ["invocation"] }
+
+log = "0.4"
+android_logger = "0.15"
+ndk-context = "0.1.1"
+tokio-util = "0.7.18"
+lazy_static = "1.5.0"
