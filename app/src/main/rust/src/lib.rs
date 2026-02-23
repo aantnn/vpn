@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt::format;
 use std::io::{Read, Write};
 use std::mem::ManuallyDrop;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::task::{ready, Context as stdContext, Poll};
@@ -94,7 +94,7 @@ impl JvmVpnService {
         }
     }
 
-    pub fn protect_fd(&self, fd: i32) -> Result<()> {
+    pub fn protect_fd(&self, fd: BorrowedFd ) -> Result<()> {
         let class_guard = self
             .vpn_class
             .read()
@@ -102,13 +102,13 @@ impl JvmVpnService {
 
         // attach_current_thread returns jni::errors::Result<T>
         self.jvm.attach_current_thread(|env: &mut jni::Env| {
-            Self::call_protect(env, &*class_guard, fd)
+            Self::call_protect(env, &*class_guard, fd.as_raw_fd())
         })?;
 
         Ok(())
     }
 
-    fn call_protect(env: &mut jni::Env, class: &Global<JClass>, fd: i32) -> Result<()> {
+    fn call_protect(env: &mut jni::Env, class: &Global<JClass>, fd: RawFd) -> Result<()> {
         let result = env
             .call_method(
                 class,
@@ -351,8 +351,7 @@ fn test_socket() -> Result<()> {
         }
     };
     let socket = TcpSocket::new_v4().expect("Failed to create socket");
-    let sock_fd = socket.as_raw_fd();
-    vpn_svc.protect_fd(sock_fd)?;
+    vpn_svc.protect_fd(socket.as_fd())?;
 
     Ok(())
 }
@@ -379,7 +378,7 @@ fn checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-async fn handle_icmp_echo_reply(tun: &AsyncFd<ParcelFd>, pkt: &mut [u8], ihl: usize) -> Result<()> {
+async fn handle_icmp_echo_reply<'a>(tun: Arc<BorrowedAsyncDevice<'a>>, pkt: &mut [u8], ihl: usize) -> Result<()> {
     // ICMP header starts after IPv4 header
     let icmp = &mut pkt[ihl..];
 
@@ -406,15 +405,7 @@ async fn handle_icmp_echo_reply(tun: &AsyncFd<ParcelFd>, pkt: &mut [u8], ihl: us
     pkt[10..12].copy_from_slice(&ipv4_checksum.to_be_bytes());
 
     // Write reply back to TUN
-    let mut guard = tun.writable().await?;
-    match guard.try_io(|inner| inner.get_ref().write(pkt)) {
-        Ok(Ok(_n)) => {
-            // write succeeded
-        }
-        Ok(Err(e)) => return Err(e.into()), // write error
-        Err(_would_block) => return Ok(()), // try again later
-    }
-
+    let mut guard = tun.send(pkt).await?;
     log::debug!("Sent ICMP Echo Reply to {}", std::net::Ipv4Addr::from(src));
 
     Ok(())
@@ -422,26 +413,15 @@ async fn handle_icmp_echo_reply(tun: &AsyncFd<ParcelFd>, pkt: &mut [u8], ihl: us
 
 #[unsafe(no_mangle)]
 pub async fn tun_read_loop(fd: jint) -> Result<()> {
-    let mut buf = [0u8; 2048];
-    // 2. Connect to server
-    let mut stream = std::net::TcpStream::connect("192.168.1.169:8080").unwrap();
-    let mut stream = AsyncTcpStream::new(stream).unwrap();
-        stream.read(&mut buf).await.with_context(|| "Failed to connect to 192.168.1.169:8080 in tun_read_loop".to_string())?; // 3. Send a simple HTTP-ish header once
-    let http_header = b"POST /tunnel HTTP/1.1\r\nHost: example\r\n\r\n";
-    //stream.set_nodelay(true)?;
-    stream.write_all(http_header).await?;
+    use tun_rs::BorrowedAsyncDevice;
+    let dev = unsafe { BorrowedAsyncDevice::borrow_raw(fd)? };
 
-
-    let tun = tun_async_from_fd(fd)?;
-    while let Ok(mut guard) = tun.readable().await {
-        let n = match guard.try_io(|inner| {
-            let mut file = inner.get_ref();
-            file.read(&mut buf)
-        }) {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_would_block) => continue,
-        };
+    let mut buf = [0; 65535];
+    let dev = Arc::new(dev);
+    let read = dev.clone();
+    let write = dev.clone();
+    loop {
+        let n = read.recv(&mut buf).await.with_context(|| "Failed to read from TUN".to_string())?;
         if n < 20 {
             log::debug!("Packet too small for IPv4 header: {} bytes", n);
             continue;
@@ -481,7 +461,7 @@ pub async fn tun_read_loop(fd: jint) -> Result<()> {
             //continue;
         }
 
-        stream.write_all(pkt).await?;
+        //stream.write_all(pkt).await?;
 
         if protocol != 1 {
             continue;
@@ -490,9 +470,10 @@ pub async fn tun_read_loop(fd: jint) -> Result<()> {
         if dst == std::net::Ipv4Addr::new(10, 10, 0, 3) {
             let icmp = &pkt[ihl..];
             if icmp[0] == 8 && icmp[1] == 0 {
-                handle_icmp_echo_reply(&tun, pkt, ihl).await?;
+                handle_icmp_echo_reply(write.clone(), pkt, ihl).await?;
             }
         }
+
     }
     Ok(())
 }
@@ -512,7 +493,9 @@ async fn client_upgraded_io(
 
 
 use std::io::{self};
+use libc::write;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tun_rs::BorrowedAsyncDevice;
 
 pub struct AsyncTcpStream {
     inner: AsyncFd<std::net::TcpStream>,

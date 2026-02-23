@@ -35,3 +35,4 @@ android_logger = "0.15"
 ndk-context = "0.1.1"
 tokio-util = "0.7.18"
 lazy_static = "1.5.0"
+tun-rs = { version = "2.8.2", features = ["async"]}
