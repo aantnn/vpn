@@ -20,8 +20,6 @@ tokio-rustls = "0.26"
 hyper-rustls = "0.27"
 rustls-pemfile = "2.1"
 
-# TUN (modern)
-tun = { version = "0.8", features = ["async"] }
 
 bytes = "1.11"
 anyhow = "1.0"
@@ -32,7 +30,6 @@ jni = { version = "0.22", features = ["invocation"] }
 
 log = "0.4"
 android_logger = "0.15"
-ndk-context = "0.1.1"
 tokio-util = "0.7.18"
-lazy_static = "1.5.0"
+
 tun-rs = { version = "2.8.2", features = ["async"]}

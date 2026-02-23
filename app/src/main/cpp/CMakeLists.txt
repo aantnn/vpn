@@ -4,6 +4,7 @@ project("vpn-dummy")
 
 # USE corrosion_set_linker(vpn ${LINKER}) because
 #[[
+NOTE env RUSTC_LOG=rustc_codegen_ssa::back::link=info
 -Clink-args is fragile because rustc only applies those flags to the top‑level crate,
 not to dependencies. That means crates like tun‑rs  (cdylib) end up linking with wrapper
 clang --target=i686-none-linux-android24,
