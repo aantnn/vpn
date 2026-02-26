@@ -20,6 +20,21 @@ use tokio::io::unix::AsyncFd;
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
+use tokio::sync::mpsc;
+
+// A global channel to send the newly generated file descriptor from Java (networkChange -> establish -> new FD)
+// down into the async Rust loop so it seamlessly replaces the old tunnel.
+static FD_CHANNEL: OnceLock<RwLock<tokio::sync::mpsc::Sender<jint>>> = OnceLock::new();
+static JVM: OnceLock<JavaVM> = OnceLock::new();
+static JVM_CTX: OnceLock<Arc<JvmVpnService>> = OnceLock::new();
+static CANCEL: OnceLock<Arc<CancellationController>> = OnceLock::new();
+
+fn get_static<T>(env: &mut jni::Env, cell: &'static OnceLock<T>, name: &str) -> jni::errors::Result<&'static T> {
+    cell.get().ok_or_else(|| {
+        let msg = format!("{name} uninitialized");
+        throw_jni_error::<JObject>(env, &msg).unwrap_err()
+    })
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn JNI_OnLoad(
@@ -27,15 +42,11 @@ pub unsafe extern "C" fn JNI_OnLoad(
     _reserved: *mut std::ffi::c_void,
 ) -> i32 {
     let jvm = unsafe { JavaVM::from_raw(vm) };
-    match JVM.set(jvm) {
-        Ok(()) => 0,
-        Err(e) => {
-            log::error!("Failed to set java VM: JNI_Onload");
-            return jni::sys::JNI_ERR;
-        }
-    };
-    JNI_VERSION_1_6
+    let _ = JVM.set(jvm);
+    jni::sys::JNI_VERSION_1_6
 }
+
+
 
 // ---------- CancellationController ----------
 
@@ -184,145 +195,162 @@ impl<'a> std::io::Write for &'a ParcelFd {
         (&*self.inner).write(buf)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self, ) -> std::io::Result<()> {
         (&*self.inner).flush()
     }
 }
 
-// ---------- Global runtime state + JNI entrypoints ----------
-static JVM: OnceLock<JavaVM> = OnceLock::new();
-static JVM_CTX: OnceLock<Arc<JvmVpnService>> = OnceLock::new();
-static CANCEL: OnceLock<Arc<CancellationController>> = OnceLock::new();
+fn throw_jni_error<T>(env: &mut jni::Env, msg: &str) -> jni::errors::Result<T> {
+    log::error!("{}", msg);
+    env.throw_new(jni_str!("java/lang/RuntimeException"), JNIString::from(msg));
+    Err(jni::errors::Error::JavaException)
+}
 
+// ---------- Global runtime state + JNI entrypoints ----------
+
+
+fn init_vars<'a>(env:&mut jni::Env, class: JClass<'a>) -> jni::errors::Result<JObject<'a>> {
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Trace)
+            .with_tag("VPN_APP"),
+    );
+
+    log::info!("initRust: STARTING INITIALIZATION...");
+
+    // Initialize Cancellation Token
+    CANCEL.get_or_init(|| Arc::new(CancellationController::new()));
+
+    // Initialize JVM Context
+    if JVM_CTX.get().is_none() {
+        let jvm = get_static(env, &JVM, "JVM")?;
+        let global = env.new_global_ref(class).map_err(|e| {
+            let msg = format!("Failed to create global ref: {e}");
+            throw_jni_error::<()>(env, &msg).unwrap_err()
+        })?;
+
+        let _ = JVM_CTX.set(Arc::new(JvmVpnService::new(jvm, global)));
+        log::info!("initRust: JVM_CTX populated.");
+    }
+
+    log::info!("initRust: SUCCESS.");
+    Ok(JObject::null())
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_ru_valishin_vpn_MyVpnService_initRust<'caller>(
     mut unowned_env: EnvUnowned<'caller>,
     class: JClass<'caller>,
 ) -> JObject<'caller> {
-    let outcome = unowned_env.with_env(|env: &mut jni::Env| -> jni::errors::Result<JObject<'_>> {
-        android_logger::init_once(
-            android_logger::Config::default()
-                .with_max_level(LevelFilter::Trace) // Set global log level
-                .with_tag("VPN_APP"), // The tag shown in logcat
-        );
-        let global = match env.new_global_ref(class) {
-            Ok(g) => g,
-            Err(e) => {
-                let msg = format!("Couldn't get global reference for VpnService: initRust {}", e);
-                log::error!("{}", msg);
-                env.throw_new(jni_str!("java/lang/RuntimeException"), JNIString::from(msg));
-                return Err(jni::errors::Error::JavaException)
-            }
-        };
-
-        let jvm = match JVM.get() {
-            Some(jvm) => jvm,
-            None => {
-                let msg = format!("Couldn't get global reference for JVM: initRust");
-                log::error!("{}", msg);
-                env.throw_new(jni_str!("java/lang/RuntimeException"), JNIString::from(msg));
-                return Err(jni::errors::Error::JavaException)
-            }
-        };
-
-        let ctx = Arc::new(JvmVpnService::new(jvm, global));
-        let _ = match JVM_CTX.set(ctx){
-            Ok(_) => (),
-            Err(_) => {
-                let msg = format!("Couldn't set JVM_CTX reference: initRust");
-                log::error!("{}", msg);
-                env.throw_new(jni_str!("java/lang/RuntimeException"), JNIString::from(msg));
-                return Err(jni::errors::Error::JavaException)
-            }
-        };
-
-        let cancel = Arc::new(CancellationController::new());
-        let _ = match CANCEL.set(cancel) {
-            Ok(_) => (),
-            Err(_) => {
-                let msg = format!("Couldn't set Cancelation token: initRust");
-                log::error!("{}", msg);
-                env.throw_new(jni_str!("java/lang/RuntimeException"), JNIString::from(msg));
-                return Err(jni::errors::Error::JavaException)
-            }
-        };
-        Ok(JObject::null())
-    });
+    let outcome = unowned_env.with_env(|env: &mut jni::Env| { init_vars(env, class ) });
     outcome.resolve::<ThrowRuntimeExAndDefault>()
 }
 
+fn get_cancellation_controller(env: &mut jni::Env) -> jni::errors::Result<Arc<CancellationController>> {
+    match CANCEL.get() {
+        Some(lock) => {
+            Ok(lock.clone())
+        },
+        None => {
+            let msg = format!("CANCEL token uninitialized: runRustVpnLoop");
+            return throw_jni_error(env, &msg)
+        }
+    }
+}
+fn run_main_loop<'a>(env: &mut jni::Env, tun_fd: jint) -> jni::errors::Result<JObject<'a>> {
+    log::info!("runRustVpnLoop: Starting with FD {tun_fd}");
+
+    let cancel = get_static(env, &CANCEL, "CANCEL")?.clone();
+    let runtime = VpnRuntime::new(cancel);
+
+    runtime.run(async move || {
+        let (tx, rx) = tokio::sync::mpsc::channel::<jint>(1);
+        // Update or Set the FD_CHANNEL
+        if let Some(lock) = FD_CHANNEL.get() {
+            let mut guard = lock.write().map_err(|_| {
+                let msg = "FD_CHANNEL lock poisoned";
+                throw_jni_error::<()>(env, msg).unwrap_err()
+            })?;
+            *guard = tx;
+        } else {
+            FD_CHANNEL.set(RwLock::new(tx)).map_err(|_| {
+                let msg = "Failed to set FD_CHANNEL";
+                throw_jni_error::<()>(env, msg).unwrap_err()
+            })?;
+        }
+
+        tun_reconnect_manager_loop(tun_fd, rx).await.map_err(|e| {
+            let msg = format!("VPN Loop Error: {e:?}");
+            throw_jni_error::<()>(env, &msg).unwrap_err()
+        })?;
+
+        Ok(JObject::null())
+    })
+}
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_ru_valishin_vpn_MyVpnService_runRustVpnLoop<'caller>(
+pub extern "C" fn Java_ru_valishin_vpn_MyVpnService_runRustVpnLoop<'caller>(
     mut unowned_env: EnvUnowned<'caller>,
     _class: JClass<'caller>,
     tun_fd: jint,
-) -> JObject<'caller>  {
-    let outcome = unowned_env.with_env(|env| -> jni::errors::Result<_>  {
-        let cancel = match CANCEL.get() {
-            Some(cancel) => cancel,
-            None => {
-                let msg = "runRustVpnLoop called before initRust or CancellationController not initialized";
-                log::error!("{}", msg);
-                env.throw_new(jni_str!("java/lang/RuntimeException"), JNIString::from(msg));
-                return Err(jni::errors::Error::JavaException)
-            }
-        };
-        let runtime  = VpnRuntime::new(cancel.clone());
-        runtime.run(async || -> jni::errors::Result<JObject> {
-            log::info!("Running TUN loop on fd {tun_fd}");
-           /* tokio::spawn(async move {
-                test_socket();
-            });*/
-            match tun_read_loop(tun_fd).await {
-                Ok(_) => Ok(JObject::null()),
-                Err(e) => {
-                    let msg = format!("Tun_read_loop failed: {:?}", e);
-                    //log::error!("{}", msg);
-                    env.throw_new(jni_str!("java/lang/RuntimeException"), JNIString::from(msg));
-                    Err(jni::errors::Error::JavaException)
-                },
-            }
-        })
+) -> JObject<'caller> {
+    let outcome = unowned_env.with_env(|env| {
+        run_main_loop(env, tun_fd)
     });
     outcome.resolve::<ThrowRuntimeExAndDefault>()
 }
 
 
+fn request_shutdown<'a>(env: &mut jni::Env) -> jni::errors::Result<JObject<'a>> {
+    let cancel = get_static(env, &CANCEL, "CANCEL")?;
+    cancel.cancel()
+        .and_then(|_| cancel.renew())
+        .map_err(|e| {
+            let msg = format!("Shutdown/Renew failed: {e}");
+            throw_jni_error::<()>(env, &msg).unwrap_err()
+        })?;
+    Ok(JObject::null())
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_ru_valishin_vpn_MyVpnService_requestRustShutdown<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+) -> JObject<'caller>{
+    let outcome = unowned_env.with_env(request_shutdown);
+    outcome.resolve::<ThrowRuntimeExAndDefault>()
+}
+
+// ----------------------------------------------------------------------
+// JNI ENDPOINT for Network Changes
+// Call this from Java when a ConnectivityManager detects a network change
+// to seamlessly transition the networking background loop.
+// ----------------------------------------------------------------------
+
+fn handle_reconnection<'a>(env: &mut jni::Env, new_tun_fd: jint) -> jni::errors::Result<JObject<'a>> {
+    log::info!("reconnectRustTunnel JNI CALL STARTED: Attempting to replace FD with new FD: {}", new_tun_fd);
+    let lock = get_static(env, &FD_CHANNEL, "FD_CHANNEL")?;
+
+    // 2. Access the channel
+    let tx = lock.read().map_err(|_| {
+        let msg = "FD_CHANNEL lock poisoned";
+        throw_jni_error::<()>(env, msg).unwrap_err()
+    })?;
+    // 3. Send the FD
+    tx.try_send(new_tun_fd).map_err(|e| {
+        let msg = format!("Reconnect failed: {e}");
+        throw_jni_error::<()>(env, &msg).unwrap_err()
+    })?;
+        log::info!("reconnectRustTunnel: SUCCESS - Sent new FD {} down the async pipeline!", new_tun_fd);
+        Ok(JObject::null())
+}
 
 #[unsafe(no_mangle)]
-pub extern "C" fn Java_ru_valishin_vpn_MyVpnService_requestRustShutdown(
-    mut unowned_env: EnvUnowned,
-    _class: JClass,
-) {
-    let outcome = unowned_env.with_env(|env| -> jni::errors::Result<()> {
-        // Ensure CANCEL is initialized
-        let cancel = match CANCEL.get() {
-            Some(c) => c,
-            None => {
-                let msg = "CancellationController not initialized";
-                log::error!("{msg}");
-                return env.throw_new(jni_str!("java/lang/RuntimeException"), JNIString::from(msg));
-            }
-        };
-
-        // Try to cancel
-        if let Err(e) = cancel.cancel() {
-            let msg = format!("Failed to cancel token: {}", e);
-            log::error!("{msg}");
-            return env.throw_new(jni_str!("java/lang/RuntimeException"), JNIString::from(msg));
-        }
-
-        // Try to renew
-        if let Err(e) = cancel.renew() {
-            let msg = format!("Failed to renew token: {}", e);
-            log::error!("{msg}");
-            return env.throw_new(jni_str!("java/lang/RuntimeException"), JNIString::from(msg));
-        }
-
-        Ok(())
-    });
-    outcome.resolve::<ThrowRuntimeExAndDefault>();
+pub extern "C" fn Java_ru_valishin_vpn_MyVpnService_reconnectRustTunnel<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    new_tun_fd: jint,
+) -> JObject<'caller> {
+    let outcome = unowned_env.with_env(|env| { handle_reconnection(env, new_tun_fd)});
+    outcome.resolve::<ThrowRuntimeExAndDefault>()
 }
 
 fn tun_async_from_fd(fd: RawFd) -> Result<AsyncFd<ParcelFd>> {
@@ -335,16 +363,21 @@ fn tun_async_from_fd(fd: RawFd) -> Result<AsyncFd<ParcelFd>> {
     AsyncFd::new(parcel).map_err(|e| anyhow!("AsyncFd error: {e}"))
 }
 
+
 fn test_socket() -> Result<()> {
+
     let vm = match JVM.get() {
-        Some(jvm) => jvm,
+        Some(jvm) => { jvm
+        },
         None => {
             error!("Failed to get VM",);
             return Err(anyhow::anyhow!("Failed to get Java VM"));
         }
     };
     let vpn_svc = match JVM_CTX.get() {
-        Some(class) => class,
+        Some(vpn_svc) => {
+           vpn_svc
+        },
         None => {
             error!("FAiled to get VM",);
             return Err(anyhow::anyhow!("Failed to get VPN class"));
@@ -411,17 +444,71 @@ async fn handle_icmp_echo_reply<'a>(tun: Arc<BorrowedAsyncDevice<'a>>, pkt: &mut
     Ok(())
 }
 
+// --- NETWORK CHANGE / RECONNECT MANAGER ---
+// This acts as the outer wrapper. It spins up the `tun_read_loop` and listens for
+// either (A) The loop failing due to Java closing the old FD natively, or (B) A new FD arriving from Java.
+pub async fn tun_reconnect_manager_loop(initial_fd: jint, mut rx: tokio::sync::mpsc::Receiver<jint>) -> Result<()> {
+    log::info!("tun_reconnect_manager_loop: ENTERED");
+    let mut current_fd = initial_fd;
+
+    loop {
+        log::info!("tun_reconnect_manager_loop: Starting tracking block for inner VPN loop on FD: {}", current_fd);
+
+        tokio::select! {
+            loop_result = tun_read_loop(current_fd) => {
+                match loop_result {
+                    Ok(_) => {
+                        log::info!("tun_reconnect_manager_loop: Inner loop exited natively cleanly (rare)");
+                        break;
+                    },
+                    Err(e) => {
+                        log::warn!("tun_reconnect_manager_loop: Inner loop CRASHED/ENDED! (EBADF usually means Android actively closed the connection via 'oldInterface?.close()'): {}", e);
+                        log::info!("tun_reconnect_manager_loop: **PAUSED SLEEP STATE** -> Waiting securely inside select! for Java to call reconnectRustTunnel() and supply the new FD...");
+                    }
+                }
+            },
+            // This runs if Java catches the network change *before* the inner read loop throws an error.
+            Some(new_fd) = rx.recv() => {
+                log::info!("tun_reconnect_manager_loop: Preemptive network change triggered via JVM! select! is dropping the old read loop instantly. Applying FD {}", new_fd);
+                current_fd = new_fd;
+            }
+        }
+    }
+
+    log::info!("tun_reconnect_manager_loop: FINISHED and EXITING fully.");
+    Ok(())
+}
+
 #[unsafe(no_mangle)]
 pub async fn tun_read_loop(fd: jint) -> Result<()> {
+    log::info!("tun_read_loop: ENTERED with fd={}", fd);
+    unsafe {
+        log::info!("tun_read_loop: Setting libc::O_NONBLOCK flag on FD...");
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
     use tun_rs::BorrowedAsyncDevice;
+    log::info!("tun_read_loop: Borrowing raw AsyncDevice via tun-rs...");
     let dev = unsafe { BorrowedAsyncDevice::borrow_raw(fd)? };
 
     let mut buf = [0; 65535];
     let dev = Arc::new(dev);
     let read = dev.clone();
     let write = dev.clone();
+
+    log::info!("tun_read_loop: Entering intensive async polling packet loop!!!");
     loop {
-        let n = read.recv(&mut buf).await.with_context(|| "Failed to read from TUN".to_string())?;
+        let n = match read.recv(&mut buf).await {
+            Ok(bytes) => {
+                // log::info!("tun_read_loop: Successfully received {} bytes natively.", bytes);
+                bytes
+            },
+            Err(e) => {
+                log::warn!("tun_read_loop: dev.recv(&mut buf) THREW NATIVE ERROR: {}", e);
+                return Err(anyhow::anyhow!("Failed to read from TUN: {}", e));
+            }
+        };
+
         if n < 20 {
             log::debug!("Packet too small for IPv4 header: {} bytes", n);
             continue;
@@ -431,8 +518,16 @@ pub async fn tun_read_loop(fd: jint) -> Result<()> {
 
         let version = pkt[0] >> 4;
         if version != 4 {
+            // log::debug!("tun_read_loop: Dropping completely non-v4 packet length {}", n);
             continue;
         }
+
+        let protocol = pkt[9];
+        let dst = std::net::Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+        let src = std::net::Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+
+        // Uncomment below strictly if making huge IP dumps
+        // log::info!("tun_read_loop: INGRESS PACKET - proto: {}, src: {}, dst: {}, size: {}", protocol, src, dst, n);
         let ihl = (pkt[0] & 0x0F) * 4;
         let tos = pkt[1];
         let total_len = u16::from_be_bytes([pkt[2], pkt[3]]) as usize;
@@ -444,18 +539,18 @@ pub async fn tun_read_loop(fd: jint) -> Result<()> {
         let src = std::net::Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
         let dst = std::net::Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
 
-        log::debug!("IPv4 packet:");
-        log::debug!("  version: {}", version);
-        log::debug!("  ihl: {} bytes", ihl);
-        log::debug!("  tos: {}", tos);
-        log::debug!("  total_len: {}", total_len);
-        log::debug!("  id: {}", id);
-        log::debug!("  flags+frag: 0x{:04x}", flags_frag);
-        log::debug!("  ttl: {}", ttl);
-        log::debug!("  protocol: {}", protocol);
-        log::debug!("  checksum: 0x{:04x}", checksum);
-        log::debug!("  src: {}", src);
-        log::debug!("  dst: {}", dst);
+        log::info!("IPv4 packet:");
+        log::info!("  version: {}", version);
+        log::info!("  ihl: {} bytes", ihl);
+        log::info!("  tos: {}", tos);
+        log::info!("  total_len: {}", total_len);
+        log::info!("  id: {}", id);
+        log::info!("  flags+frag: 0x{:04x}", flags_frag);
+        log::info!("  ttl: {}", ttl);
+        log::info!("  protocol: {}", protocol);
+        log::info!("  checksum: 0x{:04x}", checksum);
+        log::info!("  src: {}", src);
+        log::info!("  dst: {}", dst);
         let ihl = (pkt[0] & 0x0F) as usize * 4;
         if ihl < 20 || n < ihl + 8 {
             //continue;
@@ -493,6 +588,7 @@ async fn client_upgraded_io(
 
 
 use std::io::{self};
+use std::ops::Deref;
 use libc::write;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tun_rs::BorrowedAsyncDevice;
