@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+
+
+set -euo pipefail  # Exit on error, undefined vars, pipe failures
+
+# Configuration
+export APP="${APP:-com.example.app}"
+export ABI="${ABI:-i386}"
+export NDK_VERSION="${NDK_VERSION:-28.2.13676358}"
+export CLANG_VERSION="${CLANG_VERSION:-19}"
+readonly LLDB_PORT=5039
+
+# Color output for better readability
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly NC='\033[0m'  # No Color
+
+# Logging functions
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $*" >&2
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $*" >&2
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+}
+
+# Cleanup function for graceful shutdown
+cleanup() {
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        log_error "Script failed with exit code $exit_code"
+    fi
+    return $exit_code
+}
+trap cleanup EXIT
+
+# Validate prerequisites
+validate_prerequisites() {
+    log_info "Validating prerequisites..."
+    
+    # Check if adb is available
+    if ! command -v adb &> /dev/null; then
+        log_error "adb not found in PATH. Please install Android SDK Platform Tools."
+        return 1
+    fi
+    
+    # Check if device is connected
+    if ! adb devices | grep -q "device$"; then
+        log_error "No Android device found. Please connect a device or start an emulator."
+        return 1
+    fi
+    
+    log_info "✓ adb found"
+    log_info "✓ Device connected"
+}
+
+# Validate application
+validate_app() {
+    log_info "Validating application: $APP"
+    
+    if ! adb shell "pm list packages" | grep -q "^package:${APP}$"; then
+        log_error "App '$APP' not found on device. Please install it first."
+        return 1
+    fi
+    
+    log_info "✓ App '$APP' is installed"
+}
+
+# Validate and get NDK library path
+validate_ndk_path() {
+    local ndk_lib_path="$HOME/Android/Sdk/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/$CLANG_VERSION/lib/linux/$ABI"
+    
+    if [[ ! -d "$ndk_lib_path" ]]; then
+        log_error "NDK library path not found: $ndk_lib_path"
+        log_error "Please ensure NDK version $NDK_VERSION is installed in Android SDK."
+        return 1
+    fi
+    
+    log_info "✓ NDK path verified: $ndk_lib_path"
+    echo "$ndk_lib_path"
+}
+
+# Validate that lldb-server exists on device
+validate_lldb_on_device() {
+    log_info "Checking for lldb-server on device..."
+    
+    if ! adb shell "run-as $APP ls /data/local/tmp/lldb-server &>/dev/null && echo found" 2>/dev/null | grep -q "found"; then
+        log_warn "lldb-server not found at /data/local/tmp/lldb-server"
+        log_warn "You may need to manually push it or build it with NDK"
+        return 1
+    fi
+    
+    log_info "✓ lldb-server found on device"
+    return 0
+}
+
+# Main setup function
+start_adb() {
+    log_info "Starting ADB debugging setup for $APP (ABI: $ABI)"
+    
+    # Validate prerequisites
+    if ! validate_prerequisites; then
+        return 1
+    fi
+    
+    # Validate app
+    if ! validate_app; then
+        return 1
+    fi
+    
+    # Validate NDK path
+    local ndk_lib_path
+    if ! ndk_lib_path=$(validate_ndk_path); then
+        return 1
+    fi
+    
+    # Try to validate lldb-server (non-fatal if not found)
+    validate_lldb_on_device || log_warn "Continuing anyway..."
+    
+    # Push NDK libraries
+    log_info "Pushing NDK libraries to device..."
+    if ! adb push "$ndk_lib_path"* /data/local/tmp/tools 2>&1 | tail -5; then
+        log_error "Failed to push NDK libraries"
+        return 1
+    fi
+    log_info "✓ NDK libraries pushed successfully"
+    
+    # Copy lldb-server
+    log_info "Copying lldb-server to app data directory..."
+    if ! adb shell "run-as $APP cp /data/local/tmp/lldb-server /data/data/$APP/lldb-server" 2>&1; then
+        log_error "Failed to copy lldb-server. Ensure it exists at /data/local/tmp/lldb-server"
+        return 1
+    fi
+    log_info "✓ lldb-server copied successfully"
+    
+    # Set permissions
+    log_info "Setting execute permissions on lldb-server..."
+    if ! adb shell "run-as $APP chmod +x /data/data/$APP/lldb-server" 2>&1; then
+        log_warn "Failed to set permissions (may not be fatal)"
+    fi
+    log_info "✓ Permissions set"
+    
+    # Setup port forwarding
+    log_info "Setting up port forwarding on port $LLDB_PORT..."
+    if ! adb forward "tcp:$LLDB_PORT" "tcp:$LLDB_PORT" 2>&1; then
+        log_error "Failed to setup port forwarding"
+        return 1
+    fi
+    log_info "✓ Port forwarding configured"
+    
+    # Start lldb-server
+    log_info "Starting lldb-server on device..."
+    log_info "Note: The server will run in the foreground. Press Ctrl+C to stop."
+    
+    if adb shell "run-as $APP /data/data/$APP/lldb-server platform --listen *:$LLDB_PORT --server"; then
+        log_info "lldb-server started successfully"
+    else
+        log_error "Failed to start lldb-server"
+        return 1
+    fi
+}
+
+# Print usage
+print_usage() {
+    cat << EOF
+Usage: $0 [OPTIONS]
+
+Setup ADB debugging for Android app with lldb-server.
+
+OPTIONS:
+    -a, --app APP              App package name (default: $APP)
+    -b, --abi ABI              Target ABI: arm64, armeabi-v7a, x86, x86_64 (default: $ABI)
+    -n, --ndk-version VERSION  NDK version (default: $NDK_VERSION)
+    -c, --clang-version VERSION Clang version (default: $CLANG_VERSION)
+    -h, --help                 Show this help message
+
+EXAMPLES:
+    $0                                                      # Use default settings
+    $0 --app com.myapp.debug --abi arm64                  # Custom app and ABI
+    $0 --ndk-version 26.1.10909125 --clang-version 18    # Custom NDK/Clang
+    
+ENVIRONMENT VARIABLES:
+    APP                        App package name (overridable by --app)
+    ABI                        Target ABI (overridable by --abi)
+    NDK_VERSION                NDK version (overridable by --ndk-version)
+    CLANG_VERSION              Clang version (overridable by --clang-version)
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -a|--app)
+                export APP="$2"
+                shift 2
+                ;;
+            -b|--abi)
+                export ABI="$2"
+                shift 2
+                ;;
+            -n|--ndk-version)
+                export NDK_VERSION="$2"
+                shift 2
+                ;;
+            -c|--clang-version)
+                export CLANG_VERSION="$2"
+                shift 2
+                ;;
+            -h|--help)
+                print_usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                print_usage
+                return 1
+                ;;
+        esac
+    done
+}
+
+# Main execution
+main() {
+    parse_args "$@" || return 1
+    start_adb
+}
+
+main "$@"
